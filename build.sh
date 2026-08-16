@@ -23,6 +23,7 @@
 #   ./build.sh --stage-rootfs      build ONLY the reusable rootfs tarball (once)
 #   ./build.sh --from-rootfs       fast image build reusing the staged rootfs
 #   ./build.sh --update-upstream   bump kali-vm submodule + re-check patches
+#   ./build.sh --reset-vm          delete the lima builder VM (reclaim its disk)
 #
 # Env:
 #   BACKEND=lima|container
@@ -59,13 +60,6 @@ SCRATCHSIZE=20G    # container-backend fakemachine scratch
 
 log()  { echo "==> $*"; }
 die()  { echo "ERROR: $*" >&2; exit 1; }
-
-# Comma+space separated, sorted, deduped package list for debos' -t packages.
-# Strips '#' comments and blank lines so config.sh's PACKAGES can be annotated.
-packages_csv() {
-    echo "${PACKAGES}" | sed 's/#.*//' | tr ', ' '\n\n' | sed '/^$/d' \
-        | LC_ALL=C sort -u | awk 'ORS=", "' | sed 's/, $//'
-}
 
 ensure_submodule() {
     if [ ! -e "${KALIVM_DIR}/main.yaml" ]; then
@@ -121,7 +115,7 @@ debos_common_args() {
     printf '%s\n' \
         -t "arch:${ARCH}" -t "branch:${BRANCH}" -t "desktop:${DESKTOP}" \
         -t "hostname:${HOSTNAME}" -t "keyboard:${KEYBOARD}" -t "locale:${LOCALE}" \
-        -t "mirror:${MIRROR}" -t "packages:$(packages_csv)" \
+        -t "mirror:${MIRROR}" -t packages: \
         -t "password:${PASSWORD}" -t "timezone:${TIMEZONE}" -t "toolset:${TOOLSET}" \
         -t "username:${USERNAME}" -t keep:false -t zip:false -t uefi:true
 }
@@ -182,6 +176,7 @@ run_lima() {
 
     limactl shell "${LIMA_VM}" sudo bash -s -- "${HERE}" "$@" <<<"${REMOTE_BUILD}" \
         || die "debos build failed in the lima VM"
+    trim_lima_vm   # return build scratch space to the host
 }
 
 ensure_lima_vm() {
@@ -192,6 +187,21 @@ ensure_lima_vm() {
         log "Starting lima builder VM '${LIMA_VM}'..."
         limactl start --tty=false "${LIMA_VM}"
     fi
+}
+
+# Delete the builder VM so the next build recreates it fresh. The VM's disk is a
+# qcow2 on the host that grows with use and doesn't auto-shrink; over many builds
+# it can balloon (tens of GB). Run './build.sh --reset-vm' to reclaim that.
+reset_lima_vm() {
+    command -v limactl >/dev/null || die "limactl not found"
+    log "Deleting lima builder VM '${LIMA_VM}' (frees its disk on the host)..."
+    limactl delete -f "${LIMA_VM}" 2>/dev/null || true
+}
+
+# Return space freed inside the VM back to the host (lima qcow2 disks are
+# trim-capable). Cheap; run after each build.
+trim_lima_vm() {
+    limactl shell "${LIMA_VM}" sudo fstrim -a 2>/dev/null || true
 }
 
 # Fallback: debos in a privileged container via the qemu fakemachine backend
@@ -223,11 +233,14 @@ main() {
             --stage-rootfs)    mode=stage-rootfs ;;
             --from-rootfs)     mode=from-rootfs ;;
             --update-upstream) mode=update-upstream ;;
+            --reset-vm)        mode=reset-vm ;;
             --) shift; passthru+=("$@"); break ;;
             *)  passthru+=("$1") ;;
         esac
         shift
     done
+
+    [ "${mode}" = reset-vm ] && { reset_lima_vm; exit 0; }
 
     ensure_submodule
     [ "${mode}" = update-upstream ] && { update_upstream; exit 0; }
@@ -246,7 +259,6 @@ main() {
     esac
     log "Kali VM build [backend: ${BACKEND}, mode: ${mode}] -> ${target}"
     echo "    arch=${ARCH} desktop=${DESKTOP} toolset=${TOOLSET}"
-    [ "${mode}" != from-rootfs ] && echo "    extra packages: $(packages_csv)"
     echo
 
     case "${BACKEND}" in

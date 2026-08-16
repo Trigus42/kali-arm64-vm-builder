@@ -25,15 +25,8 @@ BRANCH=kali-rolling      # kali-dev | kali-last-snapshot | kali-rolling
 VERSION=rolling
 MIRROR=http://http.kali.org/kali
 
-# --- Extra apt packages -----------------------------------------------------
-# Installed into the image by debos (rootfs stage). One per line, '#' comments
-# and blank lines are fine. Non-apt tools (docker-ce, VS Code, starship, mise,
-# uv, jwt_tool) are installed by scripts/third-party-install.sh, not here.
-PACKAGES="
-  # pentest
-  sliver ffuf burpsuite bloodhound crackmapexec netexec evil-winrm hashcat
-  # dev / shell
-  git git-lfs zsh-autosuggestions zsh-syntax-highlighting nano fuse-overlayfs
-  # services / guest integration
-  openssh-server qemu-guest-agent spice-vdagent
-"
+# Extra apt packages (sliver, ffuf, docker's friends, guest agents, …) are NOT
+# here — they live in overlay/opt/ansible/playbook.yml (extra_packages), so a
+# tool-list change is a fast './build.sh --from-rootfs' rather than a full
+# rootfs rebuild. Non-apt tools (docker-ce, VS Code, starship, mise, uv,
+# jwt_tool) are installed by scripts/third-party-install.sh.

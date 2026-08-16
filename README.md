@@ -36,16 +36,23 @@ $ ./build.sh --from-rootfs     # each iteration: fast image build
 ```
 
 `--from-rootfs` reuses `images/rootfs-rolling-arm64.tar.gz` and re-applies only
-the config (overlay files + Ansible), so edits to dotfiles, sshd/sudoers,
-xfwm4, or the playbook take effect in a few minutes. Changing the **package
-list** or the **third-party installers** requires a fresh `--stage-rootfs`.
+the config (overlay files + the Ansible playbook), so edits to the **package
+list** (in the playbook), dotfiles, sshd/sudoers, xfwm4, or any playbook task
+take effect in a few minutes. Only changing the base/desktop/toolset or the
+third-party installers (`scripts/third-party-install.sh`) needs a fresh
+`--stage-rootfs`.
 
 ### Options
 
 ```console
+$ ./build.sh --reset-vm            # delete the builder VM (reclaim its disk)
 $ BACKEND=container ./build.sh     # build without lima (slow TCG fallback)
 $ LIMA_VM=my-builder ./build.sh    # use a differently-named lima instance
 ```
+
+> The builder VM's disk grows with use and doesn't auto-shrink. `build.sh`
+> trims it after each build; if it still balloons, `--reset-vm` deletes it and
+> the next build recreates it fresh.
 
 ## Run
 
@@ -89,8 +96,9 @@ $ sudo growpart /dev/vda 1 && sudo resize2fs /dev/vda1
 - **Desktop**: XFCE with compositing on; screensaver / locker / power-manager
   autostarts disabled.
 
-To change what's installed, edit **`config.sh`** (apt packages + knobs like
-user, image size, desktop, toolset).
+To add/remove tools, edit `extra_packages` in
+**`overlay/opt/ansible/playbook.yml`**; for user, image size, desktop, or
+toolset, edit **`config.sh`**.
 
 ## Configuration model
 
@@ -99,10 +107,10 @@ change each kind of thing:
 
 | File | Owns |
 |---|---|
-| `config.sh` | apt package list + knobs (user, image size, desktop, toolset) |
+| `config.sh` | knobs: user, image size, desktop, toolset, arch/branch |
+| `overlay/opt/ansible/playbook.yml` | extra apt packages + idempotent system config (services, groups, shells, perms, dotfiles, autostarts) |
 | `scripts/third-party-install.sh` | non-apt installs (docker-ce/VS Code repos, starship, mise, uv, jwt_tool) |
 | `overlay/` | static config files, dropped in verbatim (dotfiles, sshd, sudoers, xfwm4) |
-| `overlay/opt/ansible/playbook.yml` | idempotent system config (services, groups, shells, perms, autostarts) |
 
 ## How it's built
 

@@ -1,12 +1,14 @@
 ---
-# Idempotent system CONFIG applied inside the target rootfs during the build.
+# Idempotent system CONFIG + extra apt packages, applied inside the target
+# rootfs during the build (runs on every build, incl. the fast --from-rootfs
+# path — so editing the package list below is a fast rebuild).
 #
 # Ownership boundary (kept strict to avoid doing the same thing twice):
-#   - This playbook: services, group membership, shells, file perms, dotfile
-#     placement, autostart removal — anything needing idempotent config logic.
-#   - overlay/:                    static config files (dropped verbatim).
+#   - This playbook: extra apt packages + all idempotent config (services,
+#     groups, shells, perms, dotfiles, autostarts).
+#   - overlay/:                       static config files (dropped verbatim).
 #   - scripts/third-party-install.sh: non-apt installs (docker/vscode/starship…).
-#   - config.sh PACKAGES (via debos): plain Kali apt packages.
+#   - debos (base/desktop/toolset):   Kali metapackages via config.sh knobs.
 #
 # Run locally in the chroot: ansible-playbook -c local -i 'localhost,' playbook.yml -e target_user=kali
 
@@ -16,7 +18,37 @@
   gather_facts: false
   vars:
     target_user: kali
+    # Extra apt packages to install into the image. Edit freely — a change here
+    # takes effect on a fast './build.sh --from-rootfs' (no --stage-rootfs).
+    extra_packages:
+      # pentest
+      - sliver
+      - ffuf
+      - burpsuite
+      - bloodhound
+      - crackmapexec
+      - netexec
+      - evil-winrm
+      - hashcat
+      # dev / shell
+      - git
+      - git-lfs
+      - zsh-autosuggestions
+      - zsh-syntax-highlighting
+      - nano
+      - fuse-overlayfs
+      # services / guest integration
+      - openssh-server
+      - qemu-guest-agent
+      - spice-vdagent
   tasks:
+    - name: Install extra apt packages
+      ansible.builtin.apt:
+        name: "{{ extra_packages }}"
+        state: present
+        update_cache: true
+        install_recommends: false
+
     - name: Ensure .config dirs exist for dotfiles
       ansible.builtin.file:
         path: "{{ item.home }}/.config"
