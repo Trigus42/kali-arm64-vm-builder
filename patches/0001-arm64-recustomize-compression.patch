@@ -1,0 +1,103 @@
+--- a/main.yaml	2026-08-16 15:49:31
++++ b/main.yaml	2026-08-16 12:34:16
+@@ -57,6 +57,11 @@
+       uefi: {{ $uefi }}
+       variant: {{ $variant }}
+       zip: {{ $zip }}
++      username: {{ $username }}
++      # When true, re-apply the config-only customizations (overlay + ansible)
++      # in the image stage. Set when reusing a pre-built rootfs so config
++      # tweaks take effect without rebuilding the whole rootfs.
++      recustomize: {{ if $rootfs }}true{{ else }}false{{ end }}
+ {{ else }}
+   - description: "Pack {{ $rootfs }}.tar.gz"
+     action: pack
+--- a/rootfs.yaml	2026-08-16 15:49:31
++++ b/rootfs.yaml	2026-08-16 11:45:58
+@@ -94,6 +94,25 @@
+     chroot: true
+     script: scripts/finish-install.sh debconf etc-hosts terminal usergroups zsh
+ 
++  # --------------------------------------------------------------------------
++  # Custom image additions (this is the delta over a stock Kali VM image).
++  # Ordered after user creation / finish-install so /home/{{ $username }} and
++  # its zsh shell already exist.
++  # --------------------------------------------------------------------------
++  - description: "Overlay custom configuration files"
++    action: overlay
++    source: overlays/custom
++
++  - description: "Install third-party tooling (docker-ce, VS Code, starship, mise, uv, jwt_tool)"
++    action: run
++    chroot: true
++    script: scripts/third-party-install.sh {{ $username }}
++
++  - description: "Apply Ansible customizations"
++    action: run
++    chroot: true
++    script: scripts/run-ansible.sh {{ $username }}
++
+   - description: "Final cleanup (from within)"
+     action: run
+     chroot: true
+--- a/image.yaml	2026-08-16 15:49:31
++++ b/image.yaml	2026-08-16 12:34:36
+@@ -6,6 +6,8 @@
+ {{- $uefi := .uefi }}
+ {{- $variant := .variant }}
+ {{- $zip := .zip }}
++{{- $username := or .username "kali" }}
++{{- $recustomize := or .recustomize "false" }}
+ 
+ # either of: partition, file, none
+ {{- $swap := "file" }}
+@@ -72,6 +74,23 @@
+   - action: filesystem-deploy
+     setup-kernel-cmdline: false
+ 
++{{ if eq $recustomize "true" }}
++  # ---------------------------------------------------------------------------
++  # Re-apply config-only customizations when building from a pre-built rootfs.
++  # The heavy third-party *installs* are already baked into the rootfs tarball;
++  # here we only re-apply the (cheap, idempotent) overlay + Ansible tweaks so
++  # config changes take effect on fast rebuilds without redoing debootstrap.
++  # ---------------------------------------------------------------------------
++  - description: "Re-apply custom configuration overlay"
++    action: overlay
++    source: overlays/custom
++
++  - description: "Re-apply Ansible customizations"
++    action: run
++    chroot: true
++    script: scripts/run-ansible.sh {{ $username }}
++{{ end }}
++
+   - description: "Setup the swap area"
+     action: run
+     chroot: true
+@@ -86,7 +105,11 @@
+ {{ else }}
+       - grub-pc
+ {{ end }}
++{{ if eq $arch "arm64" }}
++      - linux-image-arm64
++{{ else }}
+       - linux-image-generic
++{{ end }}
+ 
+   - description: "Setup GRUB"
+     action: run
+--- a/scripts/export-qemu.sh	2026-08-16 15:49:31
++++ b/scripts/export-qemu.sh	2026-08-16 15:34:24
+@@ -22,7 +22,10 @@
+ cd $ARTIFACTDIR
+ 
+ info "Generate $image.qcow2"
+-qemu-img convert -O qcow2 $image.raw $image.qcow2
++# -c compresses clusters (zlib): a full Kali desktop+toolset install is ~17GB
++# uncompressed but ~8-10GB compressed. Still directly bootable; only cost is
++# slightly slower reads and a longer conversion.
++qemu-img convert -c -O qcow2 $image.raw $image.qcow2
+ 
+ [ $keep -eq 1 ] || rm -f $image.raw
+ 

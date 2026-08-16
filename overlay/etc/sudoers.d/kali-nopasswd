@@ -1,0 +1,4 @@
+# Passwordless sudo for the kali user (parity with the reference image).
+# The kali user is also a member of the 'sudo' group (set by finish-install.sh),
+# this file removes the password prompt.
+kali ALL=(ALL) NOPASSWD: ALL

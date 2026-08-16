@@ -1,0 +1,81 @@
+---
+# Idempotent customizations applied inside the target rootfs during the build.
+#
+# This playbook owns logic that benefits from Ansible's idempotency and
+# modules (line-in-file, group membership, service state). Static config
+# files are shipped via the debos "custom" overlay instead; third-party
+# package installs live in scripts/third-party-install.sh. Keep those three
+# concerns separate to avoid doing the same thing twice.
+#
+# Run locally in the chroot: ansible-playbook -c local -i 'localhost,' playbook.yml -e target_user=kali
+
+- name: Kali custom VM customizations
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  vars:
+    target_user: kali
+  tasks:
+    - name: Ensure passwordless sudo file has correct permissions
+      # The file itself is shipped by the overlay; enforce 0440 so sudo trusts it.
+      ansible.builtin.file:
+        path: /etc/sudoers.d/kali-nopasswd
+        owner: root
+        group: root
+        mode: "0440"
+
+    - name: Validate the sudoers drop-in parses
+      ansible.builtin.command: visudo -cf /etc/sudoers.d/kali-nopasswd
+      changed_when: false
+
+    - name: Ensure sshd_config ships with key-only auth (shipped via overlay)
+      ansible.builtin.file:
+        path: /etc/ssh/sshd_config
+        owner: root
+        group: root
+        mode: "0644"
+
+    - name: Ensure the primary user's .ssh dir exists
+      ansible.builtin.file:
+        path: "/home/{{ target_user }}/.ssh"
+        state: directory
+        owner: "{{ target_user }}"
+        group: "{{ target_user }}"
+        mode: "0700"
+
+    - name: Set default shell to zsh for the primary user
+      ansible.builtin.user:
+        name: "{{ target_user }}"
+        shell: /usr/bin/zsh
+
+    - name: Set default shell to zsh for root
+      ansible.builtin.user:
+        name: root
+        shell: /usr/bin/zsh
+
+    - name: Ensure the primary user is in the docker group
+      ansible.builtin.user:
+        name: "{{ target_user }}"
+        groups: docker
+        append: true
+
+    - name: Enable ssh service on boot
+      ansible.builtin.systemd_service:
+        name: ssh.service
+        enabled: true
+      failed_when: false
+
+    - name: Enable docker service on boot
+      ansible.builtin.systemd_service:
+        name: docker.service
+        enabled: true
+      failed_when: false
+
+    - name: Disable desktop screensaver / locker / power autostarts
+      ansible.builtin.file:
+        path: "/etc/xdg/autostart/{{ item }}"
+        state: absent
+      loop:
+        - xfce4-screensaver.desktop
+        - light-locker.desktop
+        - xfce4-power-manager.desktop

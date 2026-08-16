@@ -1,0 +1,6 @@
+ListenAddress 0.0.0.0
+AuthorizedKeysFile .ssh/authorized_keys
+PasswordAuthentication no
+KbdInteractiveAuthentication no
+UsePAM yes
+Subsystem sftp /usr/lib/openssh/sftp-server
