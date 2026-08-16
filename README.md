@@ -56,6 +56,7 @@ overlay/                 # OUR config files (dropped in as overlays/custom):
 scripts/                 # OUR scripts (merged into the recipe scripts/):
   third-party-install.sh # docker-ce, VS Code, starship, mise, uv, jwt_tool
   run-ansible.sh         # runs the Ansible playbook, then purges ansible
+lima/kali-builder.yaml   # dedicated builder VM (Debian 13 + debos, via lima)
 build.sh                 # assembles submodule + patches + overlay/scripts, runs debos
 ```
 
@@ -65,9 +66,8 @@ At build time `build.sh` assembles a work tree = `ext/kali-vm` → apply
 
 ## Build
 
-Requires **colima** (an HVF-accelerated arm64 Linux VM) — which you already
-use as your Docker backend. Docker is only needed once, to extract the debos
-binary into the VM.
+Requires **lima** (`limactl`). The build runs in a dedicated, disposable lima
+VM — it does **not** touch your colima/Docker setup. No Docker needed.
 
 Clone with the submodule (or `build.sh` will fetch it on first run):
 
@@ -85,24 +85,31 @@ Output: `images/kali-linux-rolling-qemu-arm64.qcow2` (~6.5 GB — the qcow2 is
 zlib-compressed via `qemu-img convert -c`; a full desktop+toolset install is
 ~17 GB uncompressed).
 
+> **Disk space:** a full build's peak scratch is ~40-55 GB (raw image +
+> unpacked rootfs) inside the builder VM, whose disk is a qcow2 on your Mac.
+> Keep **~60 GB free on the host** — if the Mac disk fills mid-build, the guest
+> sees "Input/output error" as its disk can't grow.
+
 ### How it runs (and why it's fast)
 
-`build.sh` runs debos with `--disable-fakemachine` **directly inside the colima
-Linux VM**. That VM is accelerated by Apple's Hypervisor.framework (HVF), so
-the build runs at near-native arm64 speed. The first run bootstraps the VM
-(installs the debos binary + `debootstrap`, `systemd-container`, `parted`,
-`qemu-utils`, … via apt) — subsequent runs skip that.
+`build.sh` runs debos with `--disable-fakemachine` inside a **dedicated lima VM**
+(`lima/kali-builder.yaml`): Debian 13 (trixie, matching Kali's base) under
+Apple's Virtualization.framework (`vz` = HVF), so the build runs at near-native
+arm64 speed. debos + its deps come from Debian's own apt repo (debos is packaged
+in trixie), installed once by the VM's provision step; the VM persists across
+builds. The build assembles its work tree on the VM's own disk (not the shared
+mount, which can't honour tar's file ops).
 
-> **Why not debos' default (fakemachine)?** debos normally spins up its *own*
-> QEMU VM. Inside the colima VM that would be a **nested** VM, and Apple only
-> supports the nested virtualization that exposes `/dev/kvm` on **M3+** — on an
-> M1/M2 the inner VM falls back to slow TCG software emulation (≈5× slower).
-> Running debos natively in the colima VM avoids the nesting entirely:
-> systemd-nspawn works there because the VM has a real systemd, `/dev/disk`
-> and loop devices.
+> **Why a real VM (not a container, and not debos' default fakemachine)?**
+> debos' `--disable-fakemachine` needs `systemd-nspawn` (a proper mount-namespace
+> root — containers lack this) and loop devices; its default fakemachine would
+> nest a QEMU VM, which falls back to slow TCG since Apple nested virt needs M3+.
+> A dedicated lima VM has both nspawn and loop devices and runs at HVF speed. We
+> use the Debian **`generic`** cloud image (not `genericcloud`) because the lean
+> one omits the 9p/virtiofs kernel modules lima needs to share the project dir.
 >
-> A container-based TCG fallback is available via `BACKEND=container ./build.sh`
-> if colima isn't usable.
+> Fallbacks: `BACKEND=colima` (runs in your existing colima VM — shares it) and
+> `BACKEND=container` (debos in a container via the slow TCG qemu backend).
 
 ### Faster rebuilds (rootfs reuse)
 
@@ -125,8 +132,9 @@ Changing the **package list** (or the third-party installers) means re-running
 Env overrides:
 
 ```console
-$ BACKEND=container ./build.sh    # TCG fallback, no colima
-$ COLIMA_PROFILE=myprofile ./build.sh
+$ BACKEND=colima ./build.sh        # run in your existing colima VM instead
+$ BACKEND=container ./build.sh     # TCG fallback, no VM (slow)
+$ LIMA_VM=my-builder ./build.sh    # use a differently-named lima instance
 ```
 
 ### Updating upstream kali-vm

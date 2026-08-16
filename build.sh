@@ -6,29 +6,33 @@
 # an Apple-Silicon (arm64) host:
 #
 #   1. Targets arm64 (upstream build.sh only supports amd64).
-#   2. Runs debos with --disable-fakemachine directly inside the colima Linux
-#      VM (which is itself HVF-accelerated). This avoids a NESTED VM: debos'
-#      normal fakemachine would launch a QEMU VM inside the colima VM, and with
-#      no /dev/kvm available (Apple nested virt needs M3+) that inner VM falls
-#      back to slow TCG emulation. Running debos natively in the colima VM keeps
-#      everything at HVF speed — systemd-nspawn works there because it has a
-#      real systemd + /dev/disk + loop devices.
+#   2. Runs debos with --disable-fakemachine directly inside a real Linux VM
+#      (HVF-accelerated). This avoids a NESTED VM: debos' normal fakemachine
+#      would launch a QEMU VM inside our VM, and with no /dev/kvm available
+#      (Apple nested virt needs M3+) that inner VM falls back to slow TCG. A
+#      real VM also gives systemd-nspawn a proper mount-namespace root and loop
+#      devices — both of which a container lacks — so --disable-fakemachine works.
 #
 # Backends:
-#   BACKEND=colima     (default) run debos natively in the colima VM  [FAST]
-#   BACKEND=container            run debos in a container via the qemu
-#                                fakemachine backend (TCG)             [SLOW fallback]
+#   BACKEND=lima      (default) dedicated, disposable Debian builder VM via lima.
+#                     Does NOT touch your colima setup.                 [FAST]
+#   BACKEND=colima              run debos inside your existing colima VM
+#                               (shares it).                            [FAST]
+#   BACKEND=container           debos in a container via the qemu fakemachine
+#                               backend (TCG).                          [SLOW fallback]
 #
 # Modes:
 #   ./build.sh                 full build (rootfs + image)
 #   ./build.sh --stage-rootfs  build ONLY the reusable rootfs tarball (once)
 #   ./build.sh --from-rootfs   fast image build reusing the staged rootfs,
 #                              re-applying config-only customizations
+#   ./build.sh --update-upstream   bump kali-vm submodule + re-check patches
 #
 # Env:
-#   BACKEND=colima|container
-#   COLIMA_PROFILE=default     (colima profile to use)
-#   DEBOS_IMAGE=godebos/debos  (container backend only)
+#   BACKEND=lima|colima|container
+#   LIMA_VM=kali-builder       (lima instance name)
+#   COLIMA_PROFILE=default     (colima backend only)
+#   DEBOS_IMAGE=godebos/debos  (source of the debos binary; container backend)
 #   CONTAINER=docker|podman    (container backend only, auto-detected)
 
 set -euo pipefail
@@ -37,7 +41,7 @@ HERE="$(cd "$(dirname "$0")" && pwd)"
 KALIVM_DIR="${HERE}/ext/kali-vm"     # upstream submodule (pristine)
 PATCHES_DIR="${HERE}/patches"        # our changes on top of upstream
 
-BACKEND="${BACKEND:-colima}"
+BACKEND="${BACKEND:-lima}"
 COLIMA_PROFILE="${COLIMA_PROFILE:-default}"
 
 # Ensure the upstream submodule is present (checked out).
@@ -174,50 +178,20 @@ echo "    arch=${ARCH} desktop=${DESKTOP} toolset=${TOOLSET}"
 [ "${MODE}" != from-rootfs ] && echo "    extra packages: ${PACKAGES_CSV}"
 echo
 
-# ============================================================================
-# Backend: colima (native, fast) — run debos inside the HVF-accelerated VM
-# ============================================================================
-run_colima() {
-    command -v colima >/dev/null || { echo "ERROR: colima not found" >&2; exit 1; }
-    colima status "${COLIMA_PROFILE}" >/dev/null 2>&1 || \
-        { echo "ERROR: colima profile '${COLIMA_PROFILE}' not running (try: colima start)" >&2; exit 1; }
-
-    # One-time bootstrap: install the debos binary + build deps into the VM.
-    # The binary is lifted from the godebos/debos image (arm64 ELF, glibc).
-    echo "==> Ensuring debos is installed in the colima VM..."
-    if ! colima ssh --profile "${COLIMA_PROFILE}" -- command -v debos >/dev/null 2>&1; then
-        command -v docker >/dev/null || { echo "ERROR: need docker (once) to extract the debos binary" >&2; exit 1; }
-        local tmp; tmp=$(mktemp)
-        local cid; cid=$(docker create --platform linux/arm64 "${DEBOS_IMAGE}")
-        docker cp "${cid}:/usr/local/bin/debos" "${tmp}"
-        docker rm "${cid}" >/dev/null
-        colima ssh --profile "${COLIMA_PROFILE}" -- sudo tee /usr/local/bin/debos >/dev/null < "${tmp}"
-        colima ssh --profile "${COLIMA_PROFILE}" -- sudo chmod +x /usr/local/bin/debos
-        rm -f "${tmp}"
-        colima ssh --profile "${COLIMA_PROFILE}" -- sudo bash -c \
-            'export DEBIAN_FRONTEND=noninteractive; apt-get update -qq && apt-get install -y -qq \
-                debootstrap systemd-container dosfstools e2fsprogs parted qemu-utils \
-                libostree-1-1 zerofree xz-utils >/dev/null'
-    fi
-
-    # Run debos natively. debos' scratch dir must be on VM-native ext4 (NOT the
-    # virtiofs mount, which can't honour tar's file ops), and it must have room
-    # for the whole rootfs (~24GB for the full toolset). The colima root disk is
-    # small (~20GB); the big data volume (where /var/lib/docker lives) has far
-    # more free space, so we place the work dir there. We pick, at runtime, the
-    # ext4 mount with the most available space.
-    local proj="${HERE}"
-    if ! colima ssh --profile "${COLIMA_PROFILE}" -- sudo bash -s -- \
-        "${proj}" "${MODE}" "${DEBOS_COMMON[@]}" "${DEBOS_MODE_ARGS[@]}" "${PASSTHRU[@]}" <<'REMOTE'
+# The in-VM build script, shared by the lima and colima backends. It receives
+# "$PROJ $MODE <debos args...>" and: picks a VM-native ext4 work dir (NOT the
+# virtiofs mount — tar can't honour its file ops), assembles the debos work tree
+# (submodule + patches + overlay/scripts), runs debos --disable-fakemachine, and
+# copies artifacts back to the mounted project images/ dir.
+read -r -d '' REMOTE_BUILD <<'REMOTE' || true
 set -euo pipefail
 PROJ="$1"; shift
 MODE="$1"; shift    # informational; debos args follow
 
-# Choose the VM-native ext4 mount with the most free space for the work dir.
-# The big data volume (holding /var/lib/docker, /var/lib/ramalama) has the most
-# room; the root disk is small. Pick the writable ext4 mount with max available.
+# Pick the writable ext4 mount with the most free space (avoids the small root
+# disk overflowing during image-partition / qemu-img convert).
 WORKBASE=$(df -PT 2>/dev/null | awk '$2=="ext4"{print $5, $7}' | sort -rn | awk 'NR==1{print $2}')
-[ -n "${WORKBASE:-}" ] && [ -w "$WORKBASE" ] || WORKBASE=/var/lib/ramalama
+[ -n "${WORKBASE:-}" ] && [ -w "$WORKBASE" ] || WORKBASE=/var/tmp
 [ -d "$WORKBASE" ] && [ -w "$WORKBASE" ] || WORKBASE=/tmp
 echo "INFO: using work base $WORKBASE ($(df -h "$WORKBASE" | awk 'NR==2{print $4}') free)"
 
@@ -228,8 +202,7 @@ trap 'rm -rf "$WORK"' EXIT
 #   1. ext/kali-vm  — pristine upstream submodule (never edited)
 #   2. patches/*    — our small changes to upstream files (arm64 kernel,
 #                     recustomize hook, qcow2 -c compression), applied on top
-#   3. overlay/ + scripts/ — OUR files, dropped in at the paths the patched
-#                     recipes expect (overlays/custom, scripts/*.sh)
+#   3. overlay/ + scripts/ — OUR files, at the paths the patched recipes expect
 cp -a "$PROJ/ext/kali-vm/." "$WORK/"
 for p in "$PROJ"/patches/*.patch; do
     [ -e "$p" ] || continue
@@ -245,18 +218,82 @@ mkdir -p "$WORK/images"
 cp -a "$PROJ/images/." "$WORK/images/" 2>/dev/null || true
 
 cd "$WORK"
-# Keep ALL of debos' temp/scratch on the big volume too — otherwise it defaults
-# to /tmp (the small ~20GB root disk) and the image-partition/qemu-img convert
-# steps overflow it ("No space left on device" mid-export). TMPDIR governs
-# where debos + qemu-img create their intermediate files.
+# Keep debos' temp/scratch on the work volume too (not the small root /tmp).
 export TMPDIR="$WORK/tmp"
 mkdir -p "$TMPDIR"
 debos --disable-fakemachine --artifactdir="$WORK/images" "$@" main.yaml
 
-# Copy artifacts back to the (virtiofs-mounted) project images dir
 mkdir -p "$PROJ/images"
 cp -a "$WORK/images/." "$PROJ/images/" 2>/dev/null || true
 REMOTE
+
+# Extract the debos binary from the godebos/debos OCI image to a host temp file.
+# (go-debos ships no release binaries and it's not in Debian; the OCI image has
+# the arm64 build at /usr/local/bin/debos.) Echoes the temp path.
+extract_debos_binary() {
+    command -v docker >/dev/null || { echo "ERROR: need docker once to extract the debos binary" >&2; return 1; }
+    local tmp cid
+    tmp=$(mktemp)
+    cid=$(docker create --platform linux/arm64 "${DEBOS_IMAGE}")
+    docker cp "${cid}:/usr/local/bin/debos" "${tmp}" >/dev/null
+    docker rm "${cid}" >/dev/null
+    echo "${tmp}"
+}
+
+# ============================================================================
+# Backend: lima (default) — dedicated, disposable Debian builder VM.
+# Does NOT touch colima. Real VM under vz/HVF: nspawn + loop devices both work.
+# ============================================================================
+run_lima() {
+    command -v limactl >/dev/null || { echo "ERROR: limactl not found (install lima)" >&2; exit 1; }
+    local vm="${LIMA_VM:-kali-builder}"
+
+    if ! limactl list --quiet 2>/dev/null | grep -qx "${vm}"; then
+        echo "==> Creating lima builder VM '${vm}' (Debian 13 + debos, ~409MB base)..."
+        limactl start --tty=false --name="${vm}" "${HERE}/lima/kali-builder.yaml"
+    elif [ "$(limactl list --format '{{.Status}}' "${vm}" 2>/dev/null)" != "Running" ]; then
+        echo "==> Starting lima builder VM '${vm}'..."
+        limactl start --tty=false "${vm}"
+    fi
+
+    # debos is installed by the template's provision step (apt, from Debian
+    # trixie) — no docker needed. Fail loudly if it's somehow missing rather
+    # than silently "succeeding" with no build.
+    if ! limactl shell "${vm}" command -v debos >/dev/null 2>&1; then
+        echo "ERROR: debos not present in '${vm}' — provisioning failed. Try: limactl delete -f ${vm} && ./build.sh" >&2
+        exit 1
+    fi
+
+    if ! limactl shell "${vm}" sudo bash -s -- \
+        "${HERE}" "${MODE}" "${DEBOS_COMMON[@]}" "${DEBOS_MODE_ARGS[@]}" "${PASSTHRU[@]}" <<<"${REMOTE_BUILD}"
+    then
+        echo "ERROR: debos build failed in the lima VM" >&2
+        exit 1
+    fi
+}
+
+# ============================================================================
+# Backend: colima — run debos inside your existing colima VM (shares it).
+# ============================================================================
+run_colima() {
+    command -v colima >/dev/null || { echo "ERROR: colima not found" >&2; exit 1; }
+    colima status "${COLIMA_PROFILE}" >/dev/null 2>&1 || \
+        { echo "ERROR: colima profile '${COLIMA_PROFILE}' not running (try: colima start)" >&2; exit 1; }
+
+    echo "==> Ensuring debos is installed in the colima VM..."
+    if ! colima ssh --profile "${COLIMA_PROFILE}" -- command -v debos >/dev/null 2>&1; then
+        local tmp; tmp=$(extract_debos_binary) || exit 1
+        colima ssh --profile "${COLIMA_PROFILE}" -- sudo tee /usr/local/bin/debos >/dev/null < "${tmp}"
+        colima ssh --profile "${COLIMA_PROFILE}" -- sudo chmod +x /usr/local/bin/debos
+        rm -f "${tmp}"
+        colima ssh --profile "${COLIMA_PROFILE}" -- sudo bash -c \
+            'export DEBIAN_FRONTEND=noninteractive; apt-get update -qq && apt-get install -y -qq \
+                debootstrap systemd-container dosfstools e2fsprogs parted qemu-utils \
+                libostree-1-1 zerofree xz-utils patch >/dev/null'
+    fi
+
+    if ! colima ssh --profile "${COLIMA_PROFILE}" -- sudo bash -s -- \
+        "${HERE}" "${MODE}" "${DEBOS_COMMON[@]}" "${DEBOS_MODE_ARGS[@]}" "${PASSTHRU[@]}" <<<"${REMOTE_BUILD}"
     then
         echo "ERROR: debos build failed in the colima VM" >&2
         exit 1
@@ -264,7 +301,9 @@ REMOTE
 }
 
 # ============================================================================
-# Backend: container (TCG fallback) — debos in a container, qemu fakemachine
+# Backend: container (TCG fallback) — debos in a container, qemu fakemachine.
+# Slow (~5x) but needs no VM. Uses the qemu backend because --disable-fakemachine
+# can't run systemd-nspawn inside a container.
 # ============================================================================
 run_container() {
     local CONTAINER="${CONTAINER:-}"
@@ -273,8 +312,6 @@ run_container() {
         elif command -v podman >/dev/null 2>&1; then CONTAINER=podman
         else echo "ERROR: neither docker nor podman found" >&2; exit 1; fi
     fi
-    # Mount the whole project read-only; assemble the work tree inside the
-    # container the same way as the colima path (submodule + patch + overlay).
     exec "${CONTAINER}" run --rm --privileged \
         --platform linux/arm64 --network host --entrypoint bash \
         -v "${HERE}:/proj:ro" -v "${HERE}/images:/out" \
@@ -302,9 +339,10 @@ run_container() {
 }
 
 case "${BACKEND}" in
+    lima)      run_lima ;;
     colima)    run_colima ;;
     container) run_container ;;
-    *) echo "ERROR: unknown BACKEND '${BACKEND}' (use colima|container)" >&2; exit 1 ;;
+    *) echo "ERROR: unknown BACKEND '${BACKEND}' (use lima|colima|container)" >&2; exit 1 ;;
 esac
 
 echo

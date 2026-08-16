@@ -1,0 +1,64 @@
+# Lima builder VM for debos.
+#
+# A dedicated, disposable Linux VM that runs debos — so we do NOT install debos
+# into (or otherwise depend on) your colima Docker VM. It's a real VM under
+# Apple's Virtualization.framework (vz = HVF-accelerated), so debos'
+# --disable-fakemachine works: nspawn has a proper mount-namespace root and the
+# guest kernel has loop devices (both of which a container lacks).
+#
+# Base: Debian 13 "trixie" generic arm64 (~409 MB). We use "generic" rather than
+# the leaner "genericcloud" because genericcloud's kernel OMITS the 9p/virtiofs
+# modules that lima needs to share the project directory into the VM. trixie
+# matches Kali rolling's base, so the debos apt deps are the right versions. The
+# debos binary + apt deps are installed ONCE (provision below); the VM persists.
+#
+# Managed by build.sh (BACKEND=lima). Start manually with:
+#   limactl start --name=kali-builder lima/kali-builder.yaml
+
+images:
+  - location: "https://cloud.debian.org/images/cloud/trixie/latest/debian-13-generic-arm64.qcow2"
+    arch: "aarch64"
+    digest: "sha512:60a2cc628f0dd114c25d70ce8388631c3f165f25c8932bc9f147987467680bcc39bda38c471c31d35056ae3eb089d22ab295583a7cbff323f21caabb467b0656"
+
+# vz = Apple Virtualization.framework (HVF), with virtiofs mounts — the fast,
+# lima-recommended combo on Apple Silicon. (The generic kernel has the virtiofs
+# module that genericcloud lacked.)
+vmType: "vz"
+mountType: "virtiofs"
+cpus: 6
+memory: "6GiB"
+# Generous virtual disk: debos' peak build scratch (raw image + unpacked rootfs)
+# is ~40-55GB. qcow2-backed, so it only consumes actual used space on the host.
+disk: "120GiB"
+
+# containerd not needed — we only run debos here.
+containerd:
+  system: false
+  user: false
+
+# Mount the project so debos can read recipes/overlay/patches and write images/.
+# NOTE: debos' scratch must NOT run on this mount (can't honour tar's file ops);
+# build.sh copies the work tree to VM-native disk before running.
+mounts:
+  - location: "~/Desktop/kali-custom-vm"
+    writable: true
+
+provision:
+  # One-time: install debos itself + its runtime deps. debos IS packaged in
+  # Debian trixie (this is why we use a trixie base), so a plain apt install
+  # gets debos + debootstrap + nspawn etc. with the right versions — no docker,
+  # no binary extraction. patch(1) is for our patches/. The VM persists, so this
+  # runs only on first create.
+  - mode: system
+    script: |
+      #!/bin/bash
+      set -euo pipefail
+      export DEBIAN_FRONTEND=noninteractive
+      if command -v debos >/dev/null 2>&1; then
+        echo "debos already provisioned"; exit 0
+      fi
+      apt-get update -qq
+      apt-get install -y -qq --no-install-recommends \
+        debos debootstrap systemd-container dosfstools e2fsprogs parted \
+        qemu-utils zerofree xz-utils patch ca-certificates
+      debos --version || true
