@@ -1,5 +1,8 @@
 # Custom Kali Linux VM image (arm64)
 
+> [!IMPORTANT]
+> **No Support** — This project is built and maintained strictly for my personal work. It is shared in case it is useful to others, but I do not offer technical support, troubleshooting, or feature maintenance.
+
 A native **arm64** Kali Linux VM image (qcow2) for Apple Silicon, built with
 [debos](https://github.com/go-debos/debos) on top of Kali's official
 [`kali-vm`](https://gitlab.com/kalilinux/build-scripts/kali-vm) recipe, with a
