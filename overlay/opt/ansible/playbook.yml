@@ -119,6 +119,20 @@
         groups: docker
         append: true
 
+    - name: Enable sddm as display manager
+      ansible.builtin.systemd_service:
+        name: sddm.service
+        enabled: true
+      failed_when: false
+
+    - name: Set sddm as default display manager
+      ansible.builtin.copy:
+        content: "/usr/sbin/sddm\n"
+        dest: /etc/X11/default-display-manager
+        owner: root
+        group: root
+        mode: "0644"
+
     - name: Enable ssh service on boot
       ansible.builtin.systemd_service:
         name: ssh.service
@@ -131,11 +145,7 @@
         enabled: true
       failed_when: false
 
-    - name: Disable desktop screensaver / locker / power autostarts
+    - name: Disable KDE power management autostart
       ansible.builtin.file:
-        path: "/etc/xdg/autostart/{{ item }}"
+        path: /etc/xdg/autostart/org.kde.powerdevil.desktop
         state: absent
-      loop:
-        - xfce4-screensaver.desktop
-        - light-locker.desktop
-        - xfce4-power-manager.desktop

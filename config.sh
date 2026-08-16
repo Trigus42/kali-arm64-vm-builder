@@ -7,7 +7,7 @@
 USERNAME=kali            # primary user
 PASSWORD=kali            # its password (change me for anything real)
 HOSTNAME=kali
-DESKTOP=xfce             # e17 | gnome | i3 | kde | lxde | mate | xfce | none
+DESKTOP=kde              # e17 | gnome | i3 | kde | lxde | mate | xfce | none
 TOOLSET=default          # default | everything | headless | large | none
 LOCALE=en_US.UTF-8
 KEYBOARD=us

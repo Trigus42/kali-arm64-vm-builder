@@ -37,7 +37,7 @@ $ ./build.sh --from-rootfs     # each iteration: fast image build
 
 `--from-rootfs` reuses `images/rootfs-rolling-arm64.tar.gz` and re-applies only
 the config (overlay files + the Ansible playbook), so edits to the **package
-list** (in the playbook), dotfiles, sshd/sudoers, xfwm4, or any playbook task
+list** (in the playbook), dotfiles, sshd/sudoers, or any playbook task
 take effect in a few minutes. Only changing the base/desktop/toolset or the
 third-party installers (`scripts/third-party-install.sh`) needs a fresh
 `--stage-rootfs`.
@@ -93,8 +93,7 @@ $ sudo growpart /dev/vda 1 && sudo resize2fs /dev/vda1
 - **Shell**: zsh default; custom `.zshrc` + `starship.toml` for `kali` and `root`.
 - **System**: passwordless sudo for `kali`; key-only SSH; ssh + docker enabled
   on boot; `kali` in the docker group; qemu/spice guest agents.
-- **Desktop**: XFCE with compositing on; screensaver / locker / power-manager
-  autostarts disabled.
+- **Desktop**: KDE Plasma (Wayland); power management disabled; autologin as `kali`.
 
 To add/remove tools, edit `extra_packages` in
 **`overlay/opt/ansible/playbook.yml`**; for user, image size, desktop, or
@@ -110,7 +109,7 @@ change each kind of thing:
 | `config.sh` | knobs: user, image size, desktop, toolset, arch/branch |
 | `overlay/opt/ansible/playbook.yml` | extra apt packages + idempotent system config (services, groups, shells, perms, dotfiles, autostarts) |
 | `scripts/third-party-install.sh` | non-apt installs (docker-ce/VS Code repos, starship, mise, uv, jwt_tool) |
-| `overlay/` | static config files, dropped in verbatim (dotfiles, sshd, sudoers, xfwm4) |
+| `overlay/` | static config files, dropped in verbatim (dotfiles, sshd, sudoers, sddm) |
 
 ## How it's built
 
