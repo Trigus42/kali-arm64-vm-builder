@@ -152,6 +152,18 @@ cp -a "$PROJ/scripts/." "$WORK/scripts/"
 mkdir -p "$WORK/images"
 cp -a "$PROJ/images/." "$WORK/images/" 2>/dev/null || true   # seed staged rootfs (from-rootfs)
 
+# Inject apt proxy config into the chroot if the cache is reachable.
+# apt-cacher-ng runs on the Mac host; transparent fallback if not up.
+APT_PROXY_CONF="$WORK/overlays/custom/etc/apt/apt.conf.d/00apt-cache-proxy"
+mkdir -p "$(dirname "$APT_PROXY_CONF")"
+if curl -sf --max-time 2 http://host.lima.internal:3142/ >/dev/null 2>&1; then
+    echo "INFO: apt-cacher-ng reachable — enabling proxy"
+    printf '\''Acquire::http::Proxy "http://host.lima.internal:3142";\n'\'' > "$APT_PROXY_CONF"
+else
+    echo "INFO: apt-cacher-ng not reachable — building without cache"
+    rm -f "$APT_PROXY_CONF"
+fi
+
 cd "$WORK"
 export TMPDIR="$WORK/tmp"; mkdir -p "$TMPDIR"   # keep debos scratch off the small root /tmp
 debos --disable-fakemachine --artifactdir="$WORK/images" "$@" main.yaml

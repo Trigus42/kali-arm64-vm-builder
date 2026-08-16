@@ -25,6 +25,21 @@ Output: `images/kali-linux-rolling-qemu-arm64.qcow2` (~6.5 GB, zlib-compressed).
 > inside the builder VM, whose disk is a qcow2 on your Mac. If the Mac fills up
 > mid-build, the guest fails with "Input/output error".
 
+### Apt cache
+
+Running a local apt cache cuts repeated build times significantly — packages are
+downloaded once and served from disk on subsequent builds.
+
+```console
+$ ./scripts/apt-cache.sh start   # start apt-cacher-ng (persistent Docker container)
+$ ./scripts/apt-cache.sh stop    # stop it
+$ ./scripts/apt-cache.sh status  # show cache size + recent log
+```
+
+The cache persists at `~/.cache/apt-cacher-ng` across restarts. `build.sh`
+detects it automatically — if `host.lima.internal:3142` is reachable when the
+build starts, the proxy is used; otherwise the build proceeds without it.
+
 ### Faster rebuilds
 
 Most of a build is debootstrap + installing the desktop and tools, which rarely
