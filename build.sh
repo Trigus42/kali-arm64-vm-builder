@@ -100,8 +100,6 @@ debos_mode_args() {
             printf '%s\n' -t "rootfs:${ROOTFS_NAME}" -t variant:rootfs \
                           -t format: -t imagename: -t imagesize: ;;
         from-rootfs)
-            [ -f "${IMAGES_DIR}/${ROOTFS_NAME}.tar.gz" ] \
-                || die "images/${ROOTFS_NAME}.tar.gz not found — run './build.sh --stage-rootfs' first"
             printf '%s\n' -t "rootfs:${ROOTFS_NAME}" -t "variant:${VARIANT}" \
                           -t "format:${FORMAT}" -t "imagename:${IMAGENAME}" -t "imagesize:${IMAGESIZE}" ;;
         full)
@@ -246,6 +244,9 @@ main() {
     [ "${mode}" = update-upstream ] && { update_upstream; exit 0; }
 
     mkdir -p "${IMAGES_DIR}"
+
+    [ "${mode}" != from-rootfs ] || [ -f "${IMAGES_DIR}/${ROOTFS_NAME}.tar.gz" ] \
+        || die "images/${ROOTFS_NAME}.tar.gz not found — run './build.sh --stage-rootfs' first"
 
     # Collect debos args for this mode into an array.
     local args=()
