@@ -1,11 +1,12 @@
 ---
-# Idempotent customizations applied inside the target rootfs during the build.
+# Idempotent system CONFIG applied inside the target rootfs during the build.
 #
-# This playbook owns logic that benefits from Ansible's idempotency and
-# modules (line-in-file, group membership, service state). Static config
-# files are shipped via the debos "custom" overlay instead; third-party
-# package installs live in scripts/third-party-install.sh. Keep those three
-# concerns separate to avoid doing the same thing twice.
+# Ownership boundary (kept strict to avoid doing the same thing twice):
+#   - This playbook: services, group membership, shells, file perms, dotfile
+#     placement, autostart removal — anything needing idempotent config logic.
+#   - overlay/:                    static config files (dropped verbatim).
+#   - scripts/third-party-install.sh: non-apt installs (docker/vscode/starship…).
+#   - config.sh PACKAGES (via debos): plain Kali apt packages.
 #
 # Run locally in the chroot: ansible-playbook -c local -i 'localhost,' playbook.yml -e target_user=kali
 
@@ -16,6 +17,17 @@
   vars:
     target_user: kali
   tasks:
+    - name: Ensure .config dirs exist for dotfiles
+      ansible.builtin.file:
+        path: "{{ item.home }}/.config"
+        state: directory
+        owner: "{{ item.owner }}"
+        group: "{{ item.owner }}"
+        mode: "0755"
+      loop:
+        - { home: "/home/{{ target_user }}", owner: "{{ target_user }}" }
+        - { home: "/root", owner: "root" }
+
     - name: Ensure passwordless sudo file has correct permissions
       # The file itself is shipped by the overlay; enforce 0440 so sudo trusts it.
       ansible.builtin.file:
@@ -52,6 +64,22 @@
       ansible.builtin.user:
         name: root
         shell: /usr/bin/zsh
+
+    - name: Place dotfiles for the primary user and root
+      # Shipped into /etc/skel by the overlay; copy to the already-created
+      # accounts (skel is only applied at useradd time).
+      ansible.builtin.copy:
+        src: "/etc/skel/{{ item.file }}"
+        dest: "{{ item.home }}/{{ item.file }}"
+        remote_src: true
+        owner: "{{ item.owner }}"
+        group: "{{ item.owner }}"
+        mode: "0644"
+      loop:
+        - { home: "/home/{{ target_user }}", owner: "{{ target_user }}", file: ".zshrc" }
+        - { home: "/home/{{ target_user }}", owner: "{{ target_user }}", file: ".config/starship.toml" }
+        - { home: "/root", owner: "root", file: ".zshrc" }
+        - { home: "/root", owner: "root", file: ".config/starship.toml" }
 
     - name: Ensure the primary user is in the docker group
       ansible.builtin.user:

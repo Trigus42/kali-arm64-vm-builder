@@ -14,65 +14,75 @@
 #      devices — both of which a container lacks — so --disable-fakemachine works.
 #
 # Backends:
-#   BACKEND=lima      (default) dedicated, disposable Debian builder VM via lima.
-#                     Does NOT touch your colima setup.                 [FAST]
-#   BACKEND=colima              run debos inside your existing colima VM
-#                               (shares it).                            [FAST]
+#   BACKEND=lima      (default) dedicated, disposable Debian builder VM.  [FAST]
 #   BACKEND=container           debos in a container via the qemu fakemachine
-#                               backend (TCG).                          [SLOW fallback]
+#                               backend (TCG).                   [SLOW fallback]
 #
 # Modes:
-#   ./build.sh                 full build (rootfs + image)
-#   ./build.sh --stage-rootfs  build ONLY the reusable rootfs tarball (once)
-#   ./build.sh --from-rootfs   fast image build reusing the staged rootfs,
-#                              re-applying config-only customizations
+#   ./build.sh                     full build (rootfs + image)
+#   ./build.sh --stage-rootfs      build ONLY the reusable rootfs tarball (once)
+#   ./build.sh --from-rootfs       fast image build reusing the staged rootfs
 #   ./build.sh --update-upstream   bump kali-vm submodule + re-check patches
 #
 # Env:
-#   BACKEND=lima|colima|container
+#   BACKEND=lima|container
 #   LIMA_VM=kali-builder       (lima instance name)
-#   COLIMA_PROFILE=default     (colima backend only)
-#   DEBOS_IMAGE=godebos/debos  (source of the debos binary; container backend)
+#   DEBOS_IMAGE=godebos/debos  (debos container image, container backend only)
 #   CONTAINER=docker|podman    (container backend only, auto-detected)
 
 set -euo pipefail
 
+# --- Configuration ----------------------------------------------------------
+
 HERE="$(cd "$(dirname "$0")" && pwd)"
 KALIVM_DIR="${HERE}/ext/kali-vm"     # upstream submodule (pristine)
 PATCHES_DIR="${HERE}/patches"        # our changes on top of upstream
+IMAGES_DIR="${HERE}/images"
+
+# User-tunable knobs (packages, user, image size, desktop, …) live in config.sh.
+# shellcheck source=config.sh
+. "${HERE}/config.sh"
 
 BACKEND="${BACKEND:-lima}"
-COLIMA_PROFILE="${COLIMA_PROFILE:-default}"
+LIMA_VM="${LIMA_VM:-kali-builder}"
+DEBOS_IMAGE="${DEBOS_IMAGE:-godebos/debos}"
 
-# Ensure the upstream submodule is present (checked out).
-if [ ! -e "${KALIVM_DIR}/main.yaml" ]; then
-    echo "==> Fetching kali-vm submodule..."
-    git -C "${HERE}" submodule update --init --recursive
-fi
+# Derived / fixed build parameters (not user knobs).
+VARIANT=qemu
+FORMAT=qemu
+IMAGENAME="kali-linux-${VERSION}-${VARIANT}-${ARCH}"
+ROOTFS_NAME="rootfs-${VERSION}-${ARCH}"
+MEMORY=4G          # container-backend fakemachine memory
+SCRATCHSIZE=20G    # container-backend fakemachine scratch
 
-# --- Mode parsing -----------------------------------------------------------
-MODE=full
-PASSTHRU=()
-while [ $# -gt 0 ]; do
-    case "$1" in
-        --stage-rootfs) MODE=stage-rootfs ;;
-        --from-rootfs)  MODE=from-rootfs ;;
-        --update-upstream) MODE=update-upstream ;;
-        --) shift; PASSTHRU+=("$@"); break ;;
-        *)  PASSTHRU+=("$1") ;;
-    esac
-    shift
-done
+# --- Small helpers ----------------------------------------------------------
 
-# --- Upstream update helper -------------------------------------------------
-# Bump the submodule to latest upstream, then check our patch still applies.
-if [ "${MODE}" = update-upstream ]; then
-    echo "==> Updating kali-vm submodule to latest upstream..."
+log()  { echo "==> $*"; }
+die()  { echo "ERROR: $*" >&2; exit 1; }
+
+# Comma+space separated, sorted, deduped package list for debos' -t packages.
+# Strips '#' comments and blank lines so config.sh's PACKAGES can be annotated.
+packages_csv() {
+    echo "${PACKAGES}" | sed 's/#.*//' | tr ', ' '\n\n' | sed '/^$/d' \
+        | LC_ALL=C sort -u | awk 'ORS=", "' | sed 's/, $//'
+}
+
+ensure_submodule() {
+    if [ ! -e "${KALIVM_DIR}/main.yaml" ]; then
+        log "Fetching kali-vm submodule..."
+        git -C "${HERE}" submodule update --init --recursive
+    fi
+}
+
+# Bump the submodule to latest upstream, then verify our patches still apply.
+update_upstream() {
+    log "Updating kali-vm submodule to latest upstream..."
     git -C "${HERE}" submodule update --remote --recursive ext/kali-vm
-    NEW=$(git -C "${KALIVM_DIR}" rev-parse --short HEAD)
-    echo "    now at ${NEW}: $(git -C "${KALIVM_DIR}" log -1 --format='%s')"
-    echo "==> Checking our patches still apply..."
-    fail=0
+    local new; new=$(git -C "${KALIVM_DIR}" rev-parse --short HEAD)
+    echo "    now at ${new}: $(git -C "${KALIVM_DIR}" log -1 --format='%s')"
+
+    log "Checking our patches still apply..."
+    local fail=0 p tmp
     for p in "${PATCHES_DIR}"/*.patch; do
         [ -e "$p" ] || continue
         tmp=$(mktemp -d); cp -a "${KALIVM_DIR}/." "$tmp/"
@@ -84,125 +94,59 @@ if [ "${MODE}" = update-upstream ]; then
         fi
         rm -rf "$tmp"
     done
-    [ $fail -eq 0 ] && echo "==> All patches apply. Commit the submodule bump when ready." \
-                    || { echo "==> Resolve patch conflicts before building." >&2; exit 1; }
-    exit 0
-fi
+    [ $fail -eq 0 ] || die "Resolve patch conflicts before building."
+    log "All patches apply. Commit the submodule bump when ready."
+}
 
-# --- Build parameters -------------------------------------------------------
-ARCH=arm64
-BRANCH=kali-rolling
-VERSION=rolling
-DESKTOP=xfce
-TOOLSET=default
-VARIANT=qemu
-FORMAT=qemu
-HOSTNAME=kali
-USERNAME=kali
-PASSWORD=kali
-LOCALE=en_US.UTF-8
-KEYBOARD=us
-TIMEZONE=America/New_York
-# Virtual disk size of the image. Kept modest because debos builds a full-size
-# *raw* image first (not sparse through mkfs/deploy), then converts to qcow2 —
-# so IMAGESIZE must fit in the VM's build scratch AND hold the installed system
-# plus room for the in-image kernel/grub install. The installed rootfs is
-# ~16.5GB; 28GB leaves ~11GB in-image headroom, and 28GB raw + ~7GB qcow2 fits
-# the build scratch. Grow later with 'qemu-img resize' + expanding the root
-# partition, or by attaching a bigger disk (see README).
-IMAGESIZE=28GB
-IMAGENAME="kali-linux-${VERSION}-${VARIANT}-${ARCH}"
-ROOTFS_NAME="rootfs-${VERSION}-${ARCH}"
+# Echo the debos -t template args for the given mode (stage-rootfs|from-rootfs|full).
+debos_mode_args() {
+    local mode=$1
+    case "$mode" in
+        stage-rootfs)
+            printf '%s\n' -t "rootfs:${ROOTFS_NAME}" -t variant:rootfs \
+                          -t format: -t imagename: -t imagesize: ;;
+        from-rootfs)
+            [ -f "${IMAGES_DIR}/${ROOTFS_NAME}.tar.gz" ] \
+                || die "images/${ROOTFS_NAME}.tar.gz not found — run './build.sh --stage-rootfs' first"
+            printf '%s\n' -t "rootfs:${ROOTFS_NAME}" -t "variant:${VARIANT}" \
+                          -t "format:${FORMAT}" -t "imagename:${IMAGENAME}" -t "imagesize:${IMAGESIZE}" ;;
+        full)
+            printf '%s\n' -t rootfs: -t "variant:${VARIANT}" \
+                          -t "format:${FORMAT}" -t "imagename:${IMAGENAME}" -t "imagesize:${IMAGESIZE}" ;;
+    esac
+}
 
-# qcow2 is sparse; --scratchsize only needs to exceed the *written* data.
-MEMORY=4G
-SCRATCHSIZE=20G
+# Common debos -t template args (shared by all modes).
+debos_common_args() {
+    printf '%s\n' \
+        -t "arch:${ARCH}" -t "branch:${BRANCH}" -t "desktop:${DESKTOP}" \
+        -t "hostname:${HOSTNAME}" -t "keyboard:${KEYBOARD}" -t "locale:${LOCALE}" \
+        -t "mirror:${MIRROR}" -t "packages:$(packages_csv)" \
+        -t "password:${PASSWORD}" -t "timezone:${TIMEZONE}" -t "toolset:${TOOLSET}" \
+        -t "username:${USERNAME}" -t keep:false -t zip:false -t uefi:true
+}
 
-# Extra apt packages: the "keep" list of tools ported from the reference image
-# that ARE available in Kali's arm64 repositories. (docker-ce, VS Code,
-# starship, mise, uv, jwt_tool are handled in scripts/third-party-install.sh.)
-PACKAGES="sliver ffuf burpsuite bloodhound crackmapexec netexec evil-winrm \
-hashcat git git-lfs zsh-autosuggestions zsh-syntax-highlighting nano \
-fuse-overlayfs openssh-server"
-
-DEBOS_IMAGE="${DEBOS_IMAGE:-godebos/debos}"
-
-# Normalise the package list: comma+space separated, sorted, deduped
-PACKAGES_CSV=$(echo "${PACKAGES}" \
-    | tr ', ' '\n\n' | sed '/^$/d' | LC_ALL=C sort -u \
-    | awk 'ORS=", "' | sed 's/, $//')
-
-mkdir -p "${HERE}/images"
-
-# --- Assemble debos template vars per mode ----------------------------------
-DEBOS_COMMON=(
-    -t arch:"${ARCH}"
-    -t branch:"${BRANCH}"
-    -t desktop:"${DESKTOP}"
-    -t hostname:"${HOSTNAME}"
-    -t keyboard:"${KEYBOARD}"
-    -t locale:"${LOCALE}"
-    -t mirror:http://http.kali.org/kali
-    -t packages:"${PACKAGES_CSV}"
-    -t password:"${PASSWORD}"
-    -t timezone:"${TIMEZONE}"
-    -t toolset:"${TOOLSET}"
-    -t username:"${USERNAME}"
-    -t keep:false
-    -t zip:false
-    -t uefi:true
-)
-
-case "${MODE}" in
-    stage-rootfs)
-        DEBOS_MODE_ARGS=( -t rootfs:"${ROOTFS_NAME}" -t variant:rootfs -t format: -t imagename: -t imagesize: )
-        SUMMARY="stage rootfs -> images/${ROOTFS_NAME}.tar.gz"
-        ;;
-    from-rootfs)
-        if [ ! -f "${HERE}/images/${ROOTFS_NAME}.tar.gz" ]; then
-            echo "ERROR: images/${ROOTFS_NAME}.tar.gz not found — run './build.sh --stage-rootfs' first" >&2
-            exit 1
-        fi
-        DEBOS_MODE_ARGS=( -t rootfs:"${ROOTFS_NAME}" -t variant:"${VARIANT}" -t format:"${FORMAT}" -t imagename:"${IMAGENAME}" -t imagesize:"${IMAGESIZE}" )
-        SUMMARY="fast image from rootfs -> images/${IMAGENAME}.qcow2"
-        ;;
-    full)
-        DEBOS_MODE_ARGS=( -t rootfs: -t variant:"${VARIANT}" -t format:"${FORMAT}" -t imagename:"${IMAGENAME}" -t imagesize:"${IMAGESIZE}" )
-        SUMMARY="full build (rootfs + image) -> images/${IMAGENAME}.qcow2"
-        ;;
-esac
-
-echo "==> Kali VM build [backend: ${BACKEND}, mode: ${MODE}]"
-echo "    ${SUMMARY}"
-echo "    arch=${ARCH} desktop=${DESKTOP} toolset=${TOOLSET}"
-[ "${MODE}" != from-rootfs ] && echo "    extra packages: ${PACKAGES_CSV}"
-echo
-
-# The in-VM build script, shared by the lima and colima backends. It receives
-# "$PROJ $MODE <debos args...>" and: picks a VM-native ext4 work dir (NOT the
-# virtiofs mount — tar can't honour its file ops), assembles the debos work tree
-# (submodule + patches + overlay/scripts), runs debos --disable-fakemachine, and
-# copies artifacts back to the mounted project images/ dir.
-read -r -d '' REMOTE_BUILD <<'REMOTE' || true
+# The build script that runs INSIDE the builder (lima VM or container). It:
+#   - picks a native ext4 work dir (NOT the shared mount — tar can't honour its
+#     file ops), with the most free space (avoids the small root disk filling)
+#   - assembles the debos work tree in three layers, like a Docker image build:
+#       1. ext/kali-vm  — pristine upstream submodule
+#       2. patches/*    — our changes to upstream files
+#       3. overlay/ + scripts/ — our files, at the paths the patched recipes use
+#   - runs debos --disable-fakemachine, then copies artifacts back to $PROJ/images
+# Invoked as: bash -s -- "$PROJ" <debos args...>   (project dir mounted at $PROJ)
+REMOTE_BUILD='
 set -euo pipefail
 PROJ="$1"; shift
-MODE="$1"; shift    # informational; debos args follow
 
-# Pick the writable ext4 mount with the most free space (avoids the small root
-# disk overflowing during image-partition / qemu-img convert).
-WORKBASE=$(df -PT 2>/dev/null | awk '$2=="ext4"{print $5, $7}' | sort -rn | awk 'NR==1{print $2}')
+WORKBASE=$(df -PT 2>/dev/null | awk '\''$2=="ext4"{print $5, $7}'\'' | sort -rn | awk '\''NR==1{print $2}'\'')
 [ -n "${WORKBASE:-}" ] && [ -w "$WORKBASE" ] || WORKBASE=/var/tmp
 [ -d "$WORKBASE" ] && [ -w "$WORKBASE" ] || WORKBASE=/tmp
-echo "INFO: using work base $WORKBASE ($(df -h "$WORKBASE" | awk 'NR==2{print $4}') free)"
+echo "INFO: using work base $WORKBASE ($(df -h "$WORKBASE" | awk '\''NR==2{print $4}'\'') free)"
 
 WORK=$(mktemp -d "$WORKBASE/debos.XXXXXX")
-trap 'rm -rf "$WORK"' EXIT
+trap '\''rm -rf "$WORK"'\'' EXIT
 
-# Assemble the debos work tree from three layers (like a Docker image build):
-#   1. ext/kali-vm  — pristine upstream submodule (never edited)
-#   2. patches/*    — our small changes to upstream files (arm64 kernel,
-#                     recustomize hook, qcow2 -c compression), applied on top
-#   3. overlay/ + scripts/ — OUR files, at the paths the patched recipes expect
 cp -a "$PROJ/ext/kali-vm/." "$WORK/"
 for p in "$PROJ"/patches/*.patch; do
     [ -e "$p" ] || continue
@@ -214,137 +158,106 @@ cp -a "$PROJ/overlay/." "$WORK/overlays/custom/"
 cp -a "$PROJ/scripts/." "$WORK/scripts/"
 
 mkdir -p "$WORK/images"
-# Seed with any already-staged artifacts (e.g. the rootfs tarball for --from-rootfs)
-cp -a "$PROJ/images/." "$WORK/images/" 2>/dev/null || true
+cp -a "$PROJ/images/." "$WORK/images/" 2>/dev/null || true   # seed staged rootfs (from-rootfs)
 
 cd "$WORK"
-# Keep debos' temp/scratch on the work volume too (not the small root /tmp).
-export TMPDIR="$WORK/tmp"
-mkdir -p "$TMPDIR"
+export TMPDIR="$WORK/tmp"; mkdir -p "$TMPDIR"   # keep debos scratch off the small root /tmp
 debos --disable-fakemachine --artifactdir="$WORK/images" "$@" main.yaml
 
 mkdir -p "$PROJ/images"
 cp -a "$WORK/images/." "$PROJ/images/" 2>/dev/null || true
-REMOTE
+'
 
-# Extract the debos binary from the godebos/debos OCI image to a host temp file.
-# (go-debos ships no release binaries and it's not in Debian; the OCI image has
-# the arm64 build at /usr/local/bin/debos.) Echoes the temp path.
-extract_debos_binary() {
-    command -v docker >/dev/null || { echo "ERROR: need docker once to extract the debos binary" >&2; return 1; }
-    local tmp cid
-    tmp=$(mktemp)
-    cid=$(docker create --platform linux/arm64 "${DEBOS_IMAGE}")
-    docker cp "${cid}:/usr/local/bin/debos" "${tmp}" >/dev/null
-    docker rm "${cid}" >/dev/null
-    echo "${tmp}"
-}
+# --- Backends ---------------------------------------------------------------
+# Each backend runs REMOTE_BUILD in its environment, passing the debos args.
 
-# ============================================================================
-# Backend: lima (default) — dedicated, disposable Debian builder VM.
-# Does NOT touch colima. Real VM under vz/HVF: nspawn + loop devices both work.
-# ============================================================================
+# Dedicated, disposable Debian builder VM under lima (vz/HVF). Real VM, so
+# nspawn + loop devices both work; debos comes from Debian trixie's apt repo
+# (installed by the VM's provision step). Does NOT touch colima/Docker.
 run_lima() {
-    command -v limactl >/dev/null || { echo "ERROR: limactl not found (install lima)" >&2; exit 1; }
-    local vm="${LIMA_VM:-kali-builder}"
+    command -v limactl >/dev/null || die "limactl not found (install lima)"
+    ensure_lima_vm
+    limactl shell "${LIMA_VM}" command -v debos >/dev/null 2>&1 \
+        || die "debos not present in '${LIMA_VM}' — provisioning failed. Try: limactl delete -f ${LIMA_VM} && ./build.sh"
 
-    if ! limactl list --quiet 2>/dev/null | grep -qx "${vm}"; then
-        echo "==> Creating lima builder VM '${vm}' (Debian 13 + debos, ~409MB base)..."
-        limactl start --tty=false --name="${vm}" "${HERE}/lima/kali-builder.yaml"
-    elif [ "$(limactl list --format '{{.Status}}' "${vm}" 2>/dev/null)" != "Running" ]; then
-        echo "==> Starting lima builder VM '${vm}'..."
-        limactl start --tty=false "${vm}"
-    fi
+    limactl shell "${LIMA_VM}" sudo bash -s -- "${HERE}" "$@" <<<"${REMOTE_BUILD}" \
+        || die "debos build failed in the lima VM"
+}
 
-    # debos is installed by the template's provision step (apt, from Debian
-    # trixie) — no docker needed. Fail loudly if it's somehow missing rather
-    # than silently "succeeding" with no build.
-    if ! limactl shell "${vm}" command -v debos >/dev/null 2>&1; then
-        echo "ERROR: debos not present in '${vm}' — provisioning failed. Try: limactl delete -f ${vm} && ./build.sh" >&2
-        exit 1
-    fi
-
-    if ! limactl shell "${vm}" sudo bash -s -- \
-        "${HERE}" "${MODE}" "${DEBOS_COMMON[@]}" "${DEBOS_MODE_ARGS[@]}" "${PASSTHRU[@]}" <<<"${REMOTE_BUILD}"
-    then
-        echo "ERROR: debos build failed in the lima VM" >&2
-        exit 1
+ensure_lima_vm() {
+    if ! limactl list --quiet 2>/dev/null | grep -qx "${LIMA_VM}"; then
+        log "Creating lima builder VM '${LIMA_VM}' (Debian 13 + debos)..."
+        limactl start --tty=false --name="${LIMA_VM}" "${HERE}/lima/kali-builder.yaml"
+    elif [ "$(limactl list --format '{{.Status}}' "${LIMA_VM}" 2>/dev/null)" != "Running" ]; then
+        log "Starting lima builder VM '${LIMA_VM}'..."
+        limactl start --tty=false "${LIMA_VM}"
     fi
 }
 
-# ============================================================================
-# Backend: colima — run debos inside your existing colima VM (shares it).
-# ============================================================================
-run_colima() {
-    command -v colima >/dev/null || { echo "ERROR: colima not found" >&2; exit 1; }
-    colima status "${COLIMA_PROFILE}" >/dev/null 2>&1 || \
-        { echo "ERROR: colima profile '${COLIMA_PROFILE}' not running (try: colima start)" >&2; exit 1; }
-
-    echo "==> Ensuring debos is installed in the colima VM..."
-    if ! colima ssh --profile "${COLIMA_PROFILE}" -- command -v debos >/dev/null 2>&1; then
-        local tmp; tmp=$(extract_debos_binary) || exit 1
-        colima ssh --profile "${COLIMA_PROFILE}" -- sudo tee /usr/local/bin/debos >/dev/null < "${tmp}"
-        colima ssh --profile "${COLIMA_PROFILE}" -- sudo chmod +x /usr/local/bin/debos
-        rm -f "${tmp}"
-        colima ssh --profile "${COLIMA_PROFILE}" -- sudo bash -c \
-            'export DEBIAN_FRONTEND=noninteractive; apt-get update -qq && apt-get install -y -qq \
-                debootstrap systemd-container dosfstools e2fsprogs parted qemu-utils \
-                libostree-1-1 zerofree xz-utils patch >/dev/null'
-    fi
-
-    if ! colima ssh --profile "${COLIMA_PROFILE}" -- sudo bash -s -- \
-        "${HERE}" "${MODE}" "${DEBOS_COMMON[@]}" "${DEBOS_MODE_ARGS[@]}" "${PASSTHRU[@]}" <<<"${REMOTE_BUILD}"
-    then
-        echo "ERROR: debos build failed in the colima VM" >&2
-        exit 1
-    fi
-}
-
-# ============================================================================
-# Backend: container (TCG fallback) — debos in a container, qemu fakemachine.
-# Slow (~5x) but needs no VM. Uses the qemu backend because --disable-fakemachine
-# can't run systemd-nspawn inside a container.
-# ============================================================================
+# Fallback: debos in a privileged container via the qemu fakemachine backend
+# (TCG, ~5x slower). Needed because --disable-fakemachine can't run nspawn in a
+# container, so we let debos spin up its own (emulated) VM instead. The extra
+# -b/--memory/--scratchsize args steer that fakemachine VM.
 run_container() {
-    local CONTAINER="${CONTAINER:-}"
-    if [ -z "${CONTAINER}" ]; then
-        if command -v docker >/dev/null 2>&1; then CONTAINER=docker
-        elif command -v podman >/dev/null 2>&1; then CONTAINER=podman
-        else echo "ERROR: neither docker nor podman found" >&2; exit 1; fi
+    local engine="${CONTAINER:-}"
+    if [ -z "${engine}" ]; then
+        if   command -v docker >/dev/null 2>&1; then engine=docker
+        elif command -v podman >/dev/null 2>&1; then engine=podman
+        else die "neither docker nor podman found"; fi
     fi
-    exec "${CONTAINER}" run --rm --privileged \
+    exec "${engine}" run --rm --privileged \
         --platform linux/arm64 --network host --entrypoint bash \
-        -v "${HERE}:/proj:ro" -v "${HERE}/images:/out" \
-        "${DEBOS_IMAGE}" \
-        -c '
-            set -e
-            mkdir -p /work && cp -a /proj/ext/kali-vm/. /work/
-            for p in /proj/patches/*.patch; do
-                [ -e "$p" ] || continue
-                echo "INFO: applying patch $(basename "$p")"
-                patch -p1 -s -d /work < "$p"
-            done
-            mkdir -p /work/overlays/custom
-            cp -a /proj/overlay/. /work/overlays/custom/
-            cp -a /proj/scripts/. /work/scripts/
-            mkdir -p /work/images
-            cp -a /out/. /work/images/ 2>/dev/null || true
-            cd /work
-            debos "$@"
-            cp -a /work/images/. /out/ 2>/dev/null || true
-        ' bash \
-        -b qemu --memory="${MEMORY}" --scratchsize="${SCRATCHSIZE}" \
-        --artifactdir=/work/images \
-        "${DEBOS_COMMON[@]}" "${DEBOS_MODE_ARGS[@]}" "${PASSTHRU[@]}" main.yaml
+        -v "${HERE}:${HERE}:ro" -v "${IMAGES_DIR}:${IMAGES_DIR}" \
+        "${DEBOS_IMAGE}" -s -- "${HERE}" \
+        -b qemu --memory="${MEMORY}" --scratchsize="${SCRATCHSIZE}" "$@" \
+        <<<"${REMOTE_BUILD}"
 }
 
-case "${BACKEND}" in
-    lima)      run_lima ;;
-    colima)    run_colima ;;
-    container) run_container ;;
-    *) echo "ERROR: unknown BACKEND '${BACKEND}' (use lima|colima|container)" >&2; exit 1 ;;
-esac
+# --- Main -------------------------------------------------------------------
 
-echo
-echo "==> Done. Artifacts in ${HERE}/images/:"
-ls -lah "${HERE}/images/" | sed 's/^/    /'
+main() {
+    local mode=full
+    local passthru=()
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --stage-rootfs)    mode=stage-rootfs ;;
+            --from-rootfs)     mode=from-rootfs ;;
+            --update-upstream) mode=update-upstream ;;
+            --) shift; passthru+=("$@"); break ;;
+            *)  passthru+=("$1") ;;
+        esac
+        shift
+    done
+
+    ensure_submodule
+    [ "${mode}" = update-upstream ] && { update_upstream; exit 0; }
+
+    mkdir -p "${IMAGES_DIR}"
+
+    # Collect debos args for this mode into an array.
+    local args=()
+    while IFS= read -r a; do args+=("$a"); done < <(debos_common_args)
+    while IFS= read -r a; do args+=("$a"); done < <(debos_mode_args "${mode}")
+
+    local target
+    case "${mode}" in
+        stage-rootfs) target="images/${ROOTFS_NAME}.tar.gz" ;;
+        *)            target="images/${IMAGENAME}.qcow2" ;;
+    esac
+    log "Kali VM build [backend: ${BACKEND}, mode: ${mode}] -> ${target}"
+    echo "    arch=${ARCH} desktop=${DESKTOP} toolset=${TOOLSET}"
+    [ "${mode}" != from-rootfs ] && echo "    extra packages: $(packages_csv)"
+    echo
+
+    case "${BACKEND}" in
+        lima)      run_lima "${args[@]}" "${passthru[@]}" ;;
+        container) run_container "${args[@]}" "${passthru[@]}" ;;
+        *) die "unknown BACKEND '${BACKEND}' (use lima|container)" ;;
+    esac
+
+    echo
+    log "Done. Artifacts in ${IMAGES_DIR}/:"
+    ls -lah "${IMAGES_DIR}/" | sed 's/^/    /'
+}
+
+main "$@"
