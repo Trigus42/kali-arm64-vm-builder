@@ -112,6 +112,15 @@ $ sudo growpart /dev/vda 1 && sudo resize2fs /dev/vda1
 - **System**: passwordless sudo for `kali`; key-only SSH; ssh + docker enabled
   on boot; `kali` in the docker group; qemu/spice guest agents.
 - **Desktop**: KDE Plasma (Wayland); power management disabled; autologin as `kali`.
+- **Autopsy** (optional, *not* baked in): the ~1 GB Autopsy 4.23.1 + Sleuth Kit
+  build stack is heavy and most sessions don't need it, so it's shipped as an
+  **on-demand installer** rather than preinstalled. To install it in the guest:
+  ```console
+  $ sudo /usr/local/src/install-autopsy.sh
+  ```
+  It builds The Sleuth Kit's Java bindings from source, wires in OpenJDK 17 +
+  OpenJFX 17, and adds an "Autopsy" entry to the KDE menu (Security / Forensics).
+  Works on arm64 and amd64.
 
 To add/remove tools, edit `extra_packages` in
 **`overlay/opt/ansible/playbook.yml`**; for user, image size, desktop, or
@@ -127,7 +136,7 @@ change each kind of thing:
 | `config.sh` | knobs: user, image size, desktop, toolset, arch/branch |
 | `overlay/opt/ansible/playbook.yml` | extra apt packages + idempotent system config (services, groups, shells, perms, dotfiles, autostarts) |
 | `scripts/third-party-install.sh` | non-apt installs (docker-ce/VS Code repos, starship, mise, uv, jwt_tool) |
-| `overlay/` | static config files, dropped in verbatim (dotfiles, sshd, sudoers, sddm) |
+| `overlay/` | static config files, dropped in verbatim (dotfiles, sshd, sudoers, sddm, the on-demand `install-autopsy.sh`) |
 
 ## How it's built
 
