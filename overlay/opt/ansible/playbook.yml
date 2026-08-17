@@ -39,6 +39,7 @@
       - fuse-overlayfs
       # services / guest integration
       - openssh-server
+      - cloud-init
       - qemu-guest-agent
       - spice-vdagent
   tasks:
@@ -143,6 +144,17 @@
       ansible.builtin.systemd_service:
         name: docker.service
         enabled: true
+      failed_when: false
+
+    - name: Enable cloud-init services on boot
+      ansible.builtin.systemd_service:
+        name: "{{ item }}"
+        enabled: true
+      loop:
+        - cloud-init-local.service
+        - cloud-init.service
+        - cloud-config.service
+        - cloud-final.service
       failed_when: false
 
     - name: Disable KDE power management autostart

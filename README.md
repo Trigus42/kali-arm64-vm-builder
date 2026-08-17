@@ -74,21 +74,29 @@ $ LIMA_VM=my-builder ./build.sh    # use a differently-named lima instance
 
 ## Run
 
+### Via UTM
+
+Generate a cloud-init seed ISO before first boot — it injects your SSH key
+and sets up the virtiofs host share automatically:
+
 ```console
-$ FW=$(dirname $(command -v qemu-system-aarch64))/../share/qemu/edk2-aarch64-code.fd
-$ qemu-system-aarch64 \
-    -machine virt -accel hvf -cpu host -smp 4 -m 4096 \
-    -bios "$FW" \
-    -drive if=virtio,file=images/kali-linux-rolling-qemu-arm64.qcow2,format=qcow2 \
-    -device virtio-gpu-pci -display default,show-cursor=on \
-    -device qemu-xhci -device usb-kbd -device usb-tablet \
-    -netdev user,id=n0,hostfwd=tcp::2222-:22 \
-    -device virtio-net-pci,netdev=n0
+$ ./scripts/make-seed-iso.sh        # reads ~/.ssh/id_ed25519.pub → images/seed.iso
+# SSH_KEY=~/.ssh/other.pub ./scripts/make-seed-iso.sh   # to use a different key
 ```
 
-Log in as `kali` / `kali`. SSH: `ssh -p 2222 kali@localhost` (key-only — add
-your key to the guest's `~/.ssh/authorized_keys` first, or log in at the
-console). qemu-guest-agent and spice-vdagent are preinstalled.
+In UTM: import `images/kali-linux-rolling-qemu-arm64.qcow2` as a new VM,
+attach `images/seed.iso` as a second drive, and (optionally) enable
+**Sharing → Share Directory** to expose a host folder. On first boot
+cloud-init injects your key and sets up `~/Share` as an automount point —
+it mounts on first access if UTM sharing is enabled, silently ignored if not.
+
+SSH once the VM is up:
+
+```console
+$ ssh kali@<guest-ip>   # IP shown in UTM or via 'ip a' in the guest
+```
+
+Clipboard sharing works via `spice-vdagent`, which is preinstalled.
 
 ### Growing the disk
 
@@ -98,7 +106,8 @@ then expand the filesystem (in the guest):
 ```console
 $ qemu-img resize images/kali-linux-rolling-qemu-arm64.qcow2 +80G
 # then, in the guest:
-$ sudo growpart /dev/vda 1 && sudo resize2fs /dev/vda1
+$ apt install cloud-guest-utils
+$ sudo growpart /dev/vda 2 && sudo resize2fs /dev/vda2
 ```
 
 ## What's in the image
