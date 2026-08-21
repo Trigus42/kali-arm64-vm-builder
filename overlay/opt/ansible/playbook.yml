@@ -42,6 +42,9 @@
       - cloud-init
       - qemu-guest-agent
       - spice-vdagent
+      # wayland->spice clipboard bridge deps (see /usr/local/bin/wayland-spice-clipboard)
+      - wl-clipboard
+      - xclip
   tasks:
     - name: Install extra apt packages
       ansible.builtin.apt:
@@ -161,3 +164,43 @@
       ansible.builtin.file:
         path: /etc/xdg/autostart/org.kde.powerdevil.desktop
         state: absent
+
+    # --- Wayland -> SPICE clipboard bridge -------------------------------------
+    # Fixes guest->host clipboard under a Wayland session (spice-vdagent is
+    # X11-only). Bridge script + user unit shipped via the overlay; here we make
+    # it executable and enable it for every user. The user unit is enabled by
+    # the canonical global symlink rather than `systemctl --global`, which needs
+    # a live D-Bus not present in the build chroot.
+    # (We do NOT touch spice-vdagent's own user unit or autostart — the Kali
+    # package already ships & enables /usr/lib/systemd/user/spice-vdagent.service.)
+    - name: Make the wayland-spice-clipboard bridge executable
+      ansible.builtin.file:
+        path: /usr/local/bin/wayland-spice-clipboard
+        owner: root
+        group: root
+        mode: "0755"
+
+    - name: Ensure the global user-unit default.target.wants dir exists
+      ansible.builtin.file:
+        path: /etc/systemd/user/default.target.wants
+        state: directory
+        owner: root
+        group: root
+        mode: "0755"
+
+    - name: Enable wayland-spice-clipboard user service for all users
+      ansible.builtin.file:
+        src: /etc/systemd/user/wayland-spice-clipboard.service
+        dest: /etc/systemd/user/default.target.wants/wayland-spice-clipboard.service
+        state: link
+
+    # spice-vdagentd is normally activated on demand by udev+socket (the SPICE
+    # virtio-port appearing -> 70-spice-vdagentd.rules -> spice-vdagentd.socket),
+    # and its units have no [Install] section, so `enabled: true` is a no-op that
+    # errors out (swallowed by failed_when). Kept only as a safeguard in case a 
+    # future host attaches SPICE without triggering udev.
+    - name: Enable spice-vdagentd daemon on boot (safeguard; usually udev/socket-activated)
+      ansible.builtin.systemd_service:
+        name: spice-vdagentd.service
+        enabled: true
+      failed_when: false

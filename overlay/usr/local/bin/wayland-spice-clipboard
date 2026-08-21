@@ -1,0 +1,108 @@
+#!/bin/bash
+# Wayland -> SPICE clipboard bridge.
+#
+# spice-vdagent was designed for X11 and cannot read the Wayland clipboard
+# directly, so guest->host clipboard copy is broken under a Wayland session.
+# This bridge polls the Wayland clipboard (wl-paste) and mirrors changes into
+# the X11 clipboard (xclip), which spice-vdagent then syncs to the SPICE host.
+#
+# Derived from https://github.com/chrisbelson/wayland-spice-clipboard-fix, but
+# the display/auth detection was rewritten for this image (KDE-on-Wayland under
+# SDDM). Two problems the upstream probe hit here (diagnosed live 2026-08-21):
+#
+#   1. Wrong display. Upstream probed :0,:1,:2 with xset and took the first to
+#      answer. :0 is the root-owned SDDM greeter Xserver (world-accessible
+#      socket, so the probe wins there), but spice-vdagent reads the user's
+#      Xwayland on :1. Copies went to a clipboard nothing reads.
+#   2. Boot race + missing cookie. :1 needs an XAUTHORITY cookie, whose path
+#      changes every boot (/run/user/1000/xauth_XXXXXX). At boot the service can
+#      start before KDE imports DISPLAY/XAUTHORITY into the user manager, so a
+#      one-shot resolve at startup captures no cookie and every xclip write to
+#      :1 fails auth for the whole session (silently, hidden by 2>/dev/null).
+#
+# Fix: resolve DISPLAY + XAUTHORITY on EVERY iteration from the user systemd
+# manager's environment (the same source spice-vdagent.service is launched
+# from) and only sync once X is actually reachable. This self-heals across the
+# boot race and across session/cookie changes.
+
+export XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
+export WAYLAND_DISPLAY="${WAYLAND_DISPLAY:-wayland-0}"
+
+import_var() {
+    systemctl --user show-environment 2>/dev/null | sed -n "s/^$1=//p" | head -1
+}
+
+# Resolve DISPLAY + XAUTHORITY for the live graphical session. Sets globals and
+# returns 0 only when the resulting X display is actually reachable.
+resolve_x() {
+    local disp xauth num sock
+
+    # Prefer whatever the user manager (and thus spice-vdagent) uses.
+    disp="$(import_var DISPLAY)"
+    xauth="$(import_var XAUTHORITY)"
+
+    # Never target the greeter's :0.
+    [ "$disp" = ":0" ] && disp=""
+
+    # Fallback: an X socket owned by this user (skip :0).
+    if [ -z "$disp" ]; then
+        for sock in /tmp/.X11-unix/X*; do
+            [ -S "$sock" ] || continue
+            num="${sock##*/X}"
+            [ "$num" = "0" ] && continue
+            if [ -O "$sock" ]; then
+                disp=":$num"
+                break
+            fi
+        done
+    fi
+    [ -z "$disp" ] && disp=":1"
+
+    # Fallback cookie: newest xauth_* in the runtime dir.
+    if [ -z "$xauth" ]; then
+        xauth="$(ls -1t "$XDG_RUNTIME_DIR"/xauth_* 2>/dev/null | head -1)"
+    fi
+
+    export DISPLAY="$disp"
+    if [ -n "$xauth" ]; then
+        export XAUTHORITY="$xauth"
+    else
+        unset XAUTHORITY
+    fi
+
+    # Reachable only if we can actually talk to the server.
+    xset q >/dev/null 2>&1
+}
+
+echo "Starting clipboard bridge"
+
+last_clipboard=""
+connected=0
+
+while true; do
+    if resolve_x; then
+        if [ "$connected" -eq 0 ]; then
+            echo "Connected to display: $DISPLAY (XAUTHORITY=${XAUTHORITY:-none})"
+            connected=1
+        fi
+
+        current_clipboard=$(wl-paste --no-newline 2>/dev/null || true)
+
+        if [ "$current_clipboard" != "$last_clipboard" ] && [ -n "$current_clipboard" ]; then
+            if printf '%s' "$current_clipboard" | xclip -selection clipboard -i 2>/dev/null; then
+                echo "Synced: $(printf '%s' "$current_clipboard" | wc -c) chars -> $DISPLAY"
+                last_clipboard="$current_clipboard"
+            fi
+        fi
+    else
+        # Not reachable yet (boot race / session not up). Keep trying; force a
+        # re-announce and re-sync once it comes back.
+        if [ "$connected" -eq 1 ]; then
+            echo "Lost X display; will re-resolve"
+        fi
+        connected=0
+        last_clipboard=""
+    fi
+
+    sleep 1
+done

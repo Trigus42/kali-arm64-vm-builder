@@ -69,7 +69,16 @@ sharing and audio was flaky). See README.md "Run" section.
   "cidata" ISO. Attach it as a second drive in UTM. On first boot cloud-init
   injects your SSH key and installs the host-share mount service.
 - Clipboard sharing works via `spice-vdagent` (preinstalled) in UTM's SPICE
-  display; no lima equivalent.
+  display; no lima equivalent. Under a **Wayland** session spice-vdagent can't
+  read the Wayland clipboard (guest->host copy breaks), so we also ship a
+  Wayland->X11 bridge (vendored from `chrisbelson/wayland-spice-clipboard-fix`):
+  `/usr/local/bin/wayland-spice-clipboard` + a globally-enabled user unit
+  (`/etc/systemd/user/` symlinked into `default.target.wants`). Deps
+  (`wl-clipboard`, `xclip`) and enablement live in the playbook. Note: we do
+  NOT ship the upstream repo's `spice-vdagent-manual.desktop` autostart — the
+  Kali `spice-vdagent` package already ships & enables its own user unit
+  (`/usr/lib/systemd/user/spice-vdagent.service`, running `spice-vdagent -x`);
+  the upstream .desktop only existed for its ad-hoc Fedora per-user install.
 
 ### cloud-init seed — hard-won gotchas (READ before editing make-seed-iso.sh)
 
