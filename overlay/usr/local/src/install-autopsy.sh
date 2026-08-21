@@ -181,6 +181,13 @@ cat > /usr/local/bin/autopsy <<LAUNCH
 #!/bin/bash
 # Autopsy launcher for the KDE Plasma (Wayland) desktop.
 export JAVA_HOME=${JAVA_HOME}
+# CRITICAL: bind Autopsy's bundled libtsk_jni.so (built against TSK ${TSK_VER}) to the
+# matching source-built core in /usr/local/lib. Kali ships its own sleuthkit/libtsk23
+# package with the SAME soname (libtsk.so.23) under /usr/lib/<triplet>, and ldconfig
+# resolves that dir BEFORE /usr/local/lib. Without this, the ${TSK_VER}-compiled JNI
+# loads against Kali's OLDER core -> ABI mismatch -> "Add Data Source" spins forever
+# at 100% CPU inside isImageSupportedStringNat. Prepending /usr/local/lib fixes it.
+export LD_LIBRARY_PATH="/usr/local/lib:\${LD_LIBRARY_PATH}"
 exec /opt/autopsy-${AUTOPSY_VER}/bin/autopsy "\$@"
 LAUNCH
 chmod +x /usr/local/bin/autopsy
