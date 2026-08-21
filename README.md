@@ -106,7 +106,7 @@ then expand the filesystem (in the guest):
 ```console
 $ qemu-img resize images/kali-linux-rolling-qemu-arm64.qcow2 +80G
 # then, in the guest:
-$ apt install cloud-guest-utils
+$ sudo apt install cloud-guest-utils
 $ sudo growpart /dev/vda 2 && sudo resize2fs /dev/vda2
 ```
 
